@@ -1,6 +1,7 @@
 const std = @import("std");
 const meta = std.meta;
 const testing = std.testing;
+const assert = std.debug.assert;
 
 const Allocator = std.mem.Allocator;
 const Archetype = @import("Archetype.zig");
@@ -92,11 +93,11 @@ pub fn new(
     }
 }
 
-pub const Delete = struct {
+pub const Relocate = struct {
     map: *EntityMap,
 
-    pub fn move(self: Delete, id: Data.Entity, _: Bucket.Index) !void {
-        _ = self.map.remove(id);
+    pub fn move(self: Relocate, id: Data.Entity, index: Bucket.Index) !void {
+        self.map.getPtr(id).?.index = index;
     }
 };
 
@@ -110,7 +111,8 @@ pub fn delete(self: *Model, id: Data.Entity) void {
     const pointer = self.entities.get(id).?; // use after free
     const bucket = self.buckets.getPtr(pointer.type).?; // use after free
     bucket.remove(pointer.index);
-    bucket.commit(Delete{ .map = &self.entities }) catch unreachable;
+    bucket.commit(Relocate{ .map = &self.entities }) catch unreachable;
+    _ = self.entities.remove(id);
 }
 
 test "create a new entity then destroy it" {
@@ -150,6 +152,8 @@ test "create a new entity then destroy it" {
     try testing.expectEqual(@as(u17, 0), entry.value_ptr.data.len);
 }
 
+/// `update` an existing entity with the given components and moving the entity
+/// if new components were added.
 pub fn update(
     self: *Model,
     mode: Mode,
@@ -168,6 +172,7 @@ pub fn update(
         const target = self.buckets.getPtr(tmp) orelse {
             return error.MissingTarget;
         };
+
         const index = switch (mode) {
             .insert => try target.insert(id),
             .append => try target.append(id),
@@ -302,6 +307,78 @@ test "create a new entity, move it, then destroy it" {
     try testing.expectEqual(@as(u17, 0), new_entry.value_ptr.data.len);
 }
 
+/// `remove` components from an entity and move the entity to a new bucket.
+pub fn remove(
+    self: *Model,
+    mode: Mode,
+    id: Data.Entity,
+    comptime components: anytype,
+) !void {
+    const spec = comptime Archetype.fromList(components);
+    const pointer = self.entities.getPtr(id).?; // use after free
+    assert(pointer.type.contains(&spec));
+
+    const old_bucket = self.buckets.getPtr(pointer.type).?; // use after free
+
+    pointer.type.diff(&spec);
+    errdefer pointer.type.merge(&spec);
+
+    const bucket = self.buckets.getPtr(pointer.type) orelse {
+        return error.MissingBucket;
+    };
+
+    const index = switch (mode) {
+        .insert => try bucket.insert(id),
+        .append => try bucket.append(id),
+    };
+
+    bucket.move(index, pointer.index, old_bucket, &pointer.type);
+    pointer.index = index;
+}
+
+test "create a new entity, remove a component, then destroy it" {
+    var model: Model = .{};
+    defer model.deinit(testing.allocator);
+
+    const Spec = struct {
+        position: Data.Point3 = .{ .x = 1, .y = 2, .z = 3 },
+        velocity: Data.Vec3 = .{ .x = 4, .y = 5, .z = 6 },
+    };
+
+    var spec = Archetype.fromType(Spec);
+    _ = try model.buckets.getOrPutValue(
+        testing.allocator,
+        spec,
+        try Bucket.init(spec),
+    );
+
+    spec.remove(.velocity);
+
+    const entry = try model.buckets.getOrPutValue(
+        testing.allocator,
+        spec,
+        try Bucket.init(spec),
+    );
+
+    const entity = try model.new(testing.allocator, .insert, Spec, &.{});
+    try model.remove(.insert, entity.id, .{.velocity});
+
+    var it = entry.value_ptr.iterate(entity.index.chunk);
+    while (it.next()) |component| {
+        switch (component.tag) {
+            .position => try testing.expectEqual(
+                Data.Point3{ .x = 1, .y = 2, .z = 3 },
+                component.array(.position)[0],
+            ),
+
+            else => unreachable,
+        }
+    }
+
+    model.delete(entity.id);
+    try testing.expectEqual(@as(u17, 0), entry.value_ptr.data.len);
+}
+
 pub fn search(self: *Model, archetype: Archetype) Search {
     return .{
         .type = archetype,
@@ -318,7 +395,7 @@ pub const Search = struct {
     pub fn next(self: *Search) ?*Bucket {
         while (self.buckets.next()) |entry| {
             if (entry.key_ptr.contains(&self.type)) {
-                entry.value_ptr.commit(Delete{
+                entry.value_ptr.commit(Relocate{
                     .map = &self.model.entities,
                 }) catch unreachable;
                 return entry.value_ptr;
@@ -329,6 +406,8 @@ pub const Search = struct {
     }
 };
 
+/// `query` bucket storage for all buckets which match the given
+/// component specification.
 pub fn query(self: *Model, comptime Spec: type) Query(
     Archetype.fromType(Spec),
     mut(Spec),

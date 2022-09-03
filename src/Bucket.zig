@@ -1,44 +1,25 @@
-//! `Bucket` maintains a hybrid SoA layout for entity components.
+//! `Bucket` maintains a hybrid SoA layout for entity components consisting of
+//! 1024 component arrays of 64 elements each. Memory is requested upfront for
+//! the maximum size of the structure relying on virtual memory support where
+//! pages are only assigned physical memory when touched.
 //!
-//! TODO: intoduction
+//! The general structure can be thought of as follows but with the components
+//! present decided at runtime:
 //!
 //! ```
-//! [1024]struct {
-//!     position: [64]Vec2,
-//!     velocity: [64]Vec2,
+//! const Chunk = [1024]struct {
+//!     position: [64]Data.Point3,
+//!     velocity: [64]Data.Vec3,
 //!     health: [64]u32,
-//!     entity_id: [64]Entity,
-//! }
+//! };
 //! ```
+//! An additional [64]Data.Entity is appended to each chunk such that it's
+//! possible to track entities inline rather than having to maintain
+//! separate storage.
 //!
-//! ```
-//!  slot
-//!   |
-//!   v
-//! ppppvvvvhhhhEEEEppppvvvvhhhhEEEE
-//! '--------------'
-//!     chunk
-//! ```
-//!
-//! ```
-//! struct {
-//!     position: Vec3,
-//!     velocity: Vec3,
-//!     health: u32,
-//!     entity_id: Entity,
-//! }
-//! ```
-//!
-//! ```
-//! pvhEpvhEpvhEpvhEpvhEpvhEpvhEpvhEpvhEpvhEpvhEpvhE (AoS)
-//! ppppppppppppvvvvvvvvvvvvhhhhhhhhhhhhEEEEEEEEEEEE (SoA)
-//! ppppvvvvhhhhEEEEppppvvvvhhhhEEEEppppvvvvhhhhEEEE (Hybrid)
-//!   where
-//!     p = position
-//!     v = velocity
-//!     h = health
-//!     E = entity_id
-//! ```
+//! Hybrid SoA was chosen for better memory locality and lower implementation
+//! complexity compared to plain SoA and as a performance improvement over AoS.
+
 const std = @import("std");
 const os = std.os;
 const mem = std.mem;
@@ -91,6 +72,7 @@ pub const Index = packed struct(u16) {
 
 pub const slot_bits = 6;
 pub const slot_mask = 0b11_1111;
+
 const entity_column = @sizeOf(Data.Entity) * 64;
 
 /// `init` reserves all memory the bucket would need upfront thus relying on
@@ -137,6 +119,10 @@ pub fn init(archetype: Archetype) !Bucket {
     };
 }
 
+/// Release memory associated with the bucket.
+///
+/// safety: ensure the entities contained within the bucket have all
+///         either moved or been removed before calling `deinit`.
 pub fn deinit(self: *Bucket) void {
     os.munmap(self.bytes[0 .. @as(usize, self.data.size) * 1024]);
     self.* = undefined;
@@ -396,7 +382,8 @@ pub fn commit(self: *Bucket, closure: anytype) !void {
     }
 }
 
-/// `move` entity components from one bucket to another.
+/// `move` entity components from one bucket to another while marking
+/// the entity in the src bucket as removed.
 pub fn move(
     dst: *Bucket,
     dst_index: Index,
@@ -579,19 +566,23 @@ pub fn chunkSize(archetype: *const Archetype) usize {
     return bytes + entity_column;
 }
 
-/// Returns a slice of component memory within a chunk.
+/// Returns a slice of component memory within a chunk used to
+/// compute the direct pointer to a component array.
 pub fn block(self: *const Bucket, chunk: Index.Chunk) []u8 {
     const start = self.data.size * @as(usize, @enumToInt(chunk));
     const end = start + self.data.size - entity_column;
     return self.bytes[start..end];
 }
 
+/// `nodes` return a slice of the entity ID array with each element
+/// interpreted as a node in the free list.
 fn nodes(self: *const Bucket, chunk: Index.Chunk) []Free.Node {
     const es = self.entities(chunk);
     return @ptrCast([*]Free.Node, es.ptr)[0..es.len];
 }
 
-/// Returns a pointer to the entity ID array for the given a chunk index.
+/// `entities` returns a slice of the entity ID array for the given
+/// chunk index.
 pub fn entities(self: *const Bucket, chunk: Index.Chunk) []Data.Entity {
     const offset = //
         self.data.size * @enumToInt(chunk) +
