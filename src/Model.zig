@@ -11,13 +11,17 @@ const Data = @import("Data.zig");
 const BoundedArray = std.BoundedArray;
 const Model = @This();
 const Type = std.builtin.Type;
+const SegmentedList = std.SegmentedList;
 
-entities: EntityMap = .{},
 buckets: BucketMap = .{},
-// TODO: dead entity stack
+/// Map of entity identifiers to their archetype and bucket index.
+entities: EntityMap = .{},
+/// Stack of retired entity identifiers to be recycled for new entities.
+dead_stack: SegmentedList(Data.Entity, 8) = .{},
+/// Maximum entity count
 count: u32 = 0,
 
-pub const EntityMap = AutoHashMapUnmanaged(Data.Entity, Pointer);
+pub const EntityMap = SegmentedList(Pointer, 8);
 pub const BucketMap = AutoHashMapUnmanaged(Archetype, Bucket);
 pub const Pointer = struct {
     index: Bucket.Index,
@@ -34,6 +38,7 @@ pub const Mode = enum {
 
 pub fn deinit(self: *Model, gpa: Allocator) void {
     self.entities.deinit(gpa);
+    self.dead_stack.deinit(gpa);
     var it = self.buckets.valueIterator();
     while (it.next()) |value| value.deinit();
     self.buckets.deinit(gpa);
@@ -53,51 +58,51 @@ pub fn new(
     comptime Spec: type,
     value: *const Spec,
 ) !Entry {
-    var limit: u32 = 0xffff_ffff;
     var count = self.count;
-    defer self.count = count;
 
-    while (true) : (limit -= 1) {
-        defer count +%= 1;
+    const archetype = comptime Archetype.fromType(Spec);
+    comptime assert(archetype.count() > 0); // empty is used as the null set
+    const target = self.buckets.getPtr(archetype) orelse return error.MissingBucket;
 
+    const id = if (self.dead_stack.pop()) |id| id else blk: {
         const id = @intToEnum(Data.Entity, count);
 
-        const entry = try self.entities.getOrPut(gpa, id);
-        if (entry.found_existing) continue; // searching
+        count += 1;
 
-        const archetype = Archetype.fromType(Spec);
-        const target = self.buckets.getPtr(archetype) orelse return error.MissingBucket;
+        _ = try self.entities.addOne(gpa);
+        assert(self.entities.len == count);
 
-        const index = switch (mode) {
-            .insert => try target.insert(id),
-            .append => try target.append(id),
-        };
+        break :blk id;
+    };
 
-        errdefer target.data.len -= 1;
+    const index = switch (mode) {
+        .insert => try target.insert(id),
+        .append => try target.append(id),
+    };
 
-        entry.value_ptr.* = .{
-            .index = index,
-            .type = archetype,
-        };
+    self.count = count;
 
-        var it = target.iterate(index.chunk);
-        inline for (Archetype.fields) |field| {
-            if (@hasField(Spec, field.name)) {
-                const tag = @field(Archetype.Tag, field.name);
-                const component = it.find(tag).?.array(tag);
-                component[index.slot] = @field(value, field.name);
-            }
+    const pointer = self.entities.at(@enumToInt(id));
+    pointer.type = archetype;
+    pointer.index = index;
+
+    var it = target.iterate(index.chunk);
+    inline for (Archetype.fields) |field| {
+        if (@hasField(Spec, field.name)) {
+            const tag = @field(Archetype.Tag, field.name);
+            const component = it.find(tag).?.array(tag);
+            component[index.slot] = @field(value, field.name);
         }
-
-        return .{ .id = id, .index = index };
     }
+
+    return .{ .id = id, .index = index };
 }
 
 pub const Relocate = struct {
     map: *EntityMap,
 
     pub fn move(self: Relocate, id: Data.Entity, index: Bucket.Index) !void {
-        self.map.getPtr(id).?.index = index;
+        self.map.at(@enumToInt(id)).index = index;
     }
 };
 
@@ -107,12 +112,14 @@ pub const Relocate = struct {
 ///       the entity's components each time it's called, it's better to
 ///       call `remove` from the bucket directly such that it may be
 ///       batch removed upon `commit`.
-pub fn delete(self: *Model, id: Data.Entity) void {
-    const pointer = self.entities.get(id).?; // use after free
+pub fn delete(self: *Model, gpa: Allocator, id: Data.Entity) !void {
+    const pointer = self.entities.at(@enumToInt(id)); // use after free
     const bucket = self.buckets.getPtr(pointer.type).?; // use after free
     bucket.remove(pointer.index);
     bucket.commit(Relocate{ .map = &self.entities }) catch unreachable;
-    _ = self.entities.remove(id);
+    pointer.type.bitset = Archetype.empty; // a bucket that is never allocated
+    pointer.index = undefined;
+    try self.dead_stack.append(gpa, id);
 }
 
 test "create a new entity then destroy it" {
@@ -124,7 +131,7 @@ test "create a new entity then destroy it" {
         velocity: Data.Vec3 = .{ .x = 4, .y = 5, .z = 6 },
     };
 
-    const spec = Archetype.fromType(Spec);
+    const spec = comptime Archetype.fromType(Spec);
     const entry = try model.buckets.getOrPutValue(
         testing.allocator,
         spec,
@@ -148,7 +155,7 @@ test "create a new entity then destroy it" {
         }
     }
 
-    model.delete(entity.id);
+    try model.delete(testing.allocator, entity.id);
     try testing.expectEqual(@as(u17, 0), entry.value_ptr.data.len);
 }
 
@@ -161,8 +168,8 @@ pub fn update(
     comptime Spec: type,
     value: *const Spec,
 ) !void {
-    const spec = Archetype.fromType(Spec);
-    const pointer = self.entities.getPtr(id).?; // use after free
+    const spec = comptime Archetype.fromType(Spec);
+    const pointer = self.entities.at(@enumToInt(id)); // use after free
     var bucket = self.buckets.getPtr(pointer.type).?; // use after free
     const different = !pointer.type.contains(&spec);
     var tmp = pointer.type;
@@ -210,7 +217,7 @@ test "create a new entity, update it, and then destroy it" {
         velocity: Data.Vec3 = .{ .x = 4, .y = 5, .z = 6 },
     };
 
-    const spec = Archetype.fromType(Spec);
+    const spec = comptime Archetype.fromType(Spec);
     const entry = try model.buckets.getOrPutValue(
         testing.allocator,
         spec,
@@ -239,7 +246,7 @@ test "create a new entity, update it, and then destroy it" {
         }
     }
 
-    model.delete(entity.id);
+    try model.delete(testing.allocator, entity.id);
     try testing.expectEqual(@as(u17, 0), entry.value_ptr.data.len);
 }
 
@@ -252,7 +259,7 @@ test "create a new entity, move it, then destroy it" {
         velocity: Data.Vec3 = .{ .x = 4, .y = 5, .z = 6 },
     };
 
-    var spec = Archetype.fromType(Spec);
+    var spec = comptime Archetype.fromType(Spec);
     const entry = try model.buckets.getOrPutValue(
         testing.allocator,
         spec,
@@ -303,7 +310,7 @@ test "create a new entity, move it, then destroy it" {
     });
     try testing.expectEqual(@as(u17, 1), entry.value_ptr.data.len);
 
-    model.delete(entity.id);
+    try model.delete(testing.allocator, entity.id);
     try testing.expectEqual(@as(u17, 0), new_entry.value_ptr.data.len);
 }
 
@@ -315,7 +322,7 @@ pub fn remove(
     comptime components: anytype,
 ) !void {
     const spec = comptime Archetype.fromList(components);
-    const pointer = self.entities.getPtr(id).?; // use after free
+    const pointer = self.entities.at(@enumToInt(id)); // use after free
     assert(pointer.type.contains(&spec));
 
     const old_bucket = self.buckets.getPtr(pointer.type).?; // use after free
@@ -345,7 +352,7 @@ test "create a new entity, remove a component, then destroy it" {
         velocity: Data.Vec3 = .{ .x = 4, .y = 5, .z = 6 },
     };
 
-    var spec = Archetype.fromType(Spec);
+    var spec = comptime Archetype.fromType(Spec);
     _ = try model.buckets.getOrPutValue(
         testing.allocator,
         spec,
@@ -375,7 +382,7 @@ test "create a new entity, remove a component, then destroy it" {
         }
     }
 
-    model.delete(entity.id);
+    try model.delete(testing.allocator, entity.id);
     try testing.expectEqual(@as(u17, 0), entry.value_ptr.data.len);
 }
 
@@ -545,6 +552,6 @@ test "create a new entity, search for it, then destroy it" {
         }
     }
 
-    model.delete(entity.id);
+    try model.delete(testing.allocator, entity.id);
     try testing.expectEqual(@as(u17, 0), entry.value_ptr.data.len);
 }
