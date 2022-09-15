@@ -26,9 +26,9 @@ const mem = std.mem;
 const testing = std.testing;
 const assert = std.debug.assert;
 
-const Archetype = @import("Archetype.zig");
 const Bucket = @This();
 const Data = @import("Data.zig");
+const Archetype = @import("Archetype.zig");
 
 type: Archetype,
 bytes: [*]align(mem.page_size) u8,
@@ -124,18 +124,18 @@ pub fn init(archetype: Archetype) !Bucket {
 /// safety: ensure the entities contained within the bucket have all
 ///         either moved or been removed before calling `deinit`.
 pub fn deinit(self: *Bucket) void {
-    os.munmap(self.bytes[0 .. @as(usize, self.data.size) * 1024]);
+    os.munmap(self.bytes[0 .. @as(usize, self.data.size) * 1024 + mem.page_size]);
     self.* = undefined;
 }
 
 test "guard page" {
     var bucket = try Bucket.init(Archetype.fromList(.{
-        .position,
+        .position_even,
         .velocity,
     }));
     defer bucket.deinit();
 
-    _ = try bucket.insert(@intToEnum(Data.Entity, 42));
+    _ = try bucket.insert(@bitCast(Data.Entity, @as(u32, 42)));
 
     const last_byte = 1024 * @as(usize, bucket.data.size) - 1;
     bucket.bytes[last_byte] = 1; // below guard page
@@ -395,8 +395,9 @@ pub fn move(
     assert(dst.type.contains(spec)); // invalid move target
     assert(src.type.contains(spec)); // invalid move source
     assert( // invalid entity id
-        dst.entities(dst_index.chunk)[dst_index.slot] ==
-        src.entities(src_index.chunk)[src_index.slot]);
+        dst.entities(dst_index.chunk)[dst_index.slot].eql(
+        src.entities(src_index.chunk)[src_index.slot],
+    ));
 
     var dst_it = dst.iterate(dst_index.chunk);
     var src_it = src.iterate(src_index.chunk);
@@ -461,7 +462,7 @@ const TestMove = struct {
     index: u16 = 0,
 
     pub fn move(self: *TestMove, entity: Data.Entity, _: Index) !void {
-        try testing.expectEqual(@intToEnum(Data.Entity, self.id[self.index]), entity);
+        try testing.expectEqual(@bitCast(Data.Entity, self.id[self.index]), entity);
         self.index += 1;
     }
 
@@ -483,14 +484,14 @@ fn testBucket(entries: u16, comptime list: anytype) !Bucket {
 
     var count: u16 = 0;
     while (count < entries) : (count += 1) {
-        _ = try bucket.insert(@intToEnum(Data.Entity, 0xffff - count));
+        _ = try bucket.insert(@bitCast(Data.Entity, @as(u32, 0xffff - count)));
     }
 
     return bucket;
 }
 
 test "removing entries from the start" {
-    var bucket = try testBucket(3, .{ .position, .velocity });
+    var bucket = try testBucket(3, .{ .position_even, .velocity });
     defer bucket.deinit();
 
     var context: TestMove = .{ .id = undefined };
@@ -503,7 +504,7 @@ test "removing entries from the start" {
 }
 
 test "removing entries from the end" {
-    var bucket = try testBucket(3, .{ .position, .velocity });
+    var bucket = try testBucket(3, .{ .position_even, .velocity });
     defer bucket.deinit();
 
     var context: TestMove = .{ .id = undefined };
@@ -515,7 +516,7 @@ test "removing entries from the end" {
 }
 
 test "removing entries from the middle" {
-    var bucket = try testBucket(5, .{ .position, .velocity });
+    var bucket = try testBucket(5, .{ .position_even, .velocity });
     defer bucket.deinit();
 
     var context: TestMove = .{ .id = undefined };
@@ -530,7 +531,7 @@ test "removing entries from the middle" {
 }
 
 test "removing entries from the ends" {
-    var bucket = try testBucket(5, .{ .position, .velocity });
+    var bucket = try testBucket(5, .{ .position_even, .velocity });
     defer bucket.deinit();
 
     var context: TestMove = .{ .id = undefined };

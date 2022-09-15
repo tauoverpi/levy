@@ -2,23 +2,35 @@ const std = @import("std");
 const mem = std.mem;
 const meta = std.meta;
 
-const Archetype = @This();
-const Data = @import("Data.zig");
 const Type = std.builtin.Type;
 
 bitset: Set = empty,
 
+const Archetype = @This();
+const Data = @import("Data.zig");
+
+/// Fields in the same order as the data model but with zero-sized fields moved to
+/// the end such that they can be skipped during iteration. This means that fields
+/// that are close in the struct definition will be close within memory thus field
+/// order can have an impact on performance.
 pub const fields = blk: {
     const order = meta.fields(Data);
     var tmp = order[0..order.len].*;
 
-    std.sort.sort(Type.StructField, &tmp, {}, struct {
-        pub fn lessThan(_: void, comptime lhs: Type.StructField, comptime rhs: Type.StructField) bool {
-            const al = @maximum(@alignOf(lhs.field_type), lhs.alignment);
-            const ar = @maximum(@alignOf(rhs.field_type), rhs.alignment);
-            return al > ar;
+    var index: u16 = 0;
+    for (order) |field| {
+        if (@sizeOf(field.field_type) != 0) {
+            tmp[index] = field;
+            index += 1;
         }
-    }.lessThan);
+    }
+
+    for (order) |field| {
+        if (@sizeOf(field.field_type) == 0) {
+            tmp[index] = field;
+            index += 1;
+        }
+    }
 
     break :blk tmp;
 };
