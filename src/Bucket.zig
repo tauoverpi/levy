@@ -1,5 +1,5 @@
 //! `Bucket` maintains a hybrid SoA layout for entity components consisting of
-//! 1024 component arrays of 64 elements each. Memory is requested upfront for
+//! N component chunks of M elements each. Memory is requested upfront for
 //! the maximum size of the structure relying on virtual memory support where
 //! pages are only assigned physical memory when touched.
 //!
@@ -7,13 +7,13 @@
 //! present decided at runtime:
 //!
 //! ```
-//! const Chunk = [1024]struct {
-//!     position: [64]Data.Point3,
-//!     velocity: [64]Data.Vec3,
-//!     health: [64]u32,
+//! const Chunk = [N]struct {
+//!     position: [M]Data.Point3,
+//!     velocity: [M]Data.Vec3,
+//!     health: [M]u32,
 //! };
 //! ```
-//! An additional [64]Data.Entity is appended to each chunk such that it's
+//! An additional [M]Data.Entity is appended to each chunk such that it's
 //! possible to track entities inline rather than having to maintain
 //! separate storage.
 //!
@@ -33,21 +33,25 @@ const Archetype = @import("Archetype.zig");
 type: Archetype,
 bytes: [*]align(mem.page_size) u8,
 free: Free = .{},
-data: Meta = .{},
+data: Meta,
 
-pub const Meta = packed struct(u32) {
+pub const Meta = packed struct(u64) {
+    /// Size of chunks in bytes
+    size: u32,
     /// Number of slots used within the bucket
     len: u17 = 0,
-    /// Size of chunks
-    size: u15 = 0,
+    /// Number of slots within each chunk as a power of two starting from 1
+    slots: u4,
+    /// Free space for sale
+    padding: u11 = 0,
 };
 
 pub const Free = extern struct {
     head: Index = tail_end,
     tail: Index = head_end,
 
-    const head_end: Index = idx(0, 0);
-    const tail_end: Index = idx((1 << 6) - 1, (1 << 10) - 1);
+    const head_end: Index = @intToEnum(Index, 0);
+    const tail_end: Index = @intToEnum(Index, 0xffff);
 
     pub const Node = extern struct {
         next: Index,
@@ -55,18 +59,23 @@ pub const Free = extern struct {
     };
 
     pub fn isEmpty(self: Free) bool {
-        return @bitCast(u16, self.head) > @bitCast(u16, self.tail);
+        return @enumToInt(self.head) > @enumToInt(self.tail);
     }
 };
 
-pub const Index = packed struct(u16) {
-    slot: u6,
-    chunk: Chunk,
+pub const Index = enum(u16) {
+    _,
 
-    pub const Chunk = enum(u10) { _ };
+    pub inline fn chunk(self: Index, slots: u4) u16 {
+        return @enumToInt(self) >> slots;
+    }
+
+    pub inline fn slot(self: Index, slots: u4) u16 {
+        return @enumToInt(self) & ((@as(u16, 1) << slots) - 1);
+    }
 
     pub inline fn eql(self: Index, other: Index) bool {
-        return @bitCast(u16, self) == @bitCast(u16, other);
+        return self == other;
     }
 };
 
@@ -87,9 +96,10 @@ const entity_column = @sizeOf(Data.Entity) * 64;
 /// | 1024 * 64 * @sizeOf(components) |   4096   |
 /// '---------------------------------'----------'
 /// ```
-pub fn init(archetype: Archetype) !Bucket {
-    const size = chunkSize(&archetype);
-    const bytes = size * 1024;
+pub fn init(archetype: Archetype, slots: u4) !Bucket {
+    const size = chunkSize(&archetype, slots);
+    const chunks = @as(u32, 1) << (16 - @as(u5, slots));
+    const bytes = size * chunks;
 
     // memory + guard page
     const memory = try os.mmap(
@@ -115,7 +125,10 @@ pub fn init(archetype: Archetype) !Bucket {
     return .{
         .type = archetype,
         .bytes = memory.ptr,
-        .data = .{ .size = @intCast(u15, size) },
+        .data = .{
+            .size = @intCast(u32, size),
+            .slots = slots,
+        },
     };
 }
 
@@ -124,7 +137,8 @@ pub fn init(archetype: Archetype) !Bucket {
 /// safety: ensure the entities contained within the bucket have all
 ///         either moved or been removed before calling `deinit`.
 pub fn deinit(self: *Bucket) void {
-    os.munmap(self.bytes[0 .. @as(usize, self.data.size) * 1024 + mem.page_size]);
+    const chunks = @as(u32, 1) << (16 - @as(u5, self.data.slots));
+    os.munmap(self.bytes[0 .. @as(usize, self.data.size) * chunks + mem.page_size]);
     self.* = undefined;
 }
 
@@ -132,15 +146,16 @@ test "guard page" {
     var bucket = try Bucket.init(Archetype.fromList(.{
         .position_even,
         .velocity,
-    }));
+    }), 6);
     defer bucket.deinit();
 
     _ = try bucket.insert(@bitCast(Data.Entity, @as(u32, 42)));
 
-    const last_byte = 1024 * @as(usize, bucket.data.size) - 1;
+    const chunks = @as(u32, 1) << (16 - @as(u5, bucket.data.slots));
+    const last_byte = chunks * @as(usize, bucket.data.size) - 1;
     bucket.bytes[last_byte] = 1; // below guard page
 
-    bucket.remove(idx(0, 0));
+    bucket.remove(@intToEnum(Index, 0));
     try bucket.commit(struct {
         pub fn move(_: Data.Entity, _: Index) !void {}
     });
@@ -150,18 +165,20 @@ test "guard page" {
 
 pub const ComponentIterator = struct {
     type: Archetype.Iterator,
+    slots: u16,
     bytes: [*]u8,
 
     pub const Component = struct {
         tag: Archetype.Tag,
+        slots: u16,
         ptr: [*]u8,
 
         pub fn array(
             self: Component,
             comptime tag: Archetype.Tag,
-        ) *[64]Archetype.TypeOf(tag) {
+        ) []Archetype.TypeOf(tag) {
             assert(@field(Archetype.Tag, @tagName(tag)) == self.tag);
-            return @ptrCast(*[64]Archetype.TypeOf(tag), self.ptr);
+            return @ptrCast([*]Archetype.TypeOf(tag), self.ptr)[0..self.slots];
         }
     };
 
@@ -171,9 +188,9 @@ pub const ComponentIterator = struct {
         const size: usize = Archetype.size[index];
         if (size == 0) return null;
 
-        defer self.bytes += 64 * size;
+        defer self.bytes += self.slots * size;
 
-        return .{ .tag = tag, .ptr = self.bytes };
+        return .{ .tag = tag, .ptr = self.bytes, .slots = self.slots };
     }
 
     pub fn find(self: *ComponentIterator, tag: Archetype.Tag) ?Component {
@@ -186,11 +203,12 @@ pub const ComponentIterator = struct {
 };
 
 /// `iterate` over the components within a chunk at the given index.
-pub fn iterate(self: *const Bucket, chunk: Index.Chunk) ComponentIterator {
-    assert(@enumToInt(chunk) <= self.data.len >> slot_bits); // use after free
+pub fn iterate(self: *const Bucket, chunk: u16) ComponentIterator {
+    assert(chunk <= self.data.len >> self.data.slots); // use after free
     return .{
         .type = self.type.iterator(),
         .bytes = self.block(chunk).ptr,
+        .slots = @as(u16, 1) << self.data.slots,
     };
 }
 
@@ -216,9 +234,9 @@ pub fn insert(self: *Bucket, id: Data.Entity) error{OutOfMemory}!Index {
     if (self.free.isEmpty()) {
         return try self.append(id);
     } else {
-        const chunk = self.free.head.chunk;
-        const slot = self.free.head.slot;
-        const next = self.nodes(chunk)[slot].next;
+        const next_chunk = self.free.head.chunk(self.data.slots);
+        const next_slot = self.free.head.slot(self.data.slots);
+        const next = self.nodes(next_chunk)[next_slot].next;
 
         defer {
             if (self.free.head.eql(next)) {
@@ -229,7 +247,9 @@ pub fn insert(self: *Bucket, id: Data.Entity) error{OutOfMemory}!Index {
         }
 
         const index = self.free.head;
-        self.entities(index.chunk)[index.slot] = id;
+        const index_chunk = index.chunk(self.data.slots);
+        const index_slot = index.slot(self.data.slots);
+        self.entities(index_chunk)[index_slot] = id;
 
         return index;
     }
@@ -253,9 +273,9 @@ pub fn append(self: *Bucket, id: Data.Entity) error{OutOfMemory}!Index {
     assert(self.data.len <= 0x1_0000);
     if (self.data.len == 0x1_0000) return error.OutOfMemory;
 
-    const index = @bitCast(Index, @intCast(u16, self.data.len));
+    const index = @intToEnum(Index, @intCast(u16, self.data.len));
     self.data.len += 1;
-    self.entities(index.chunk)[index.slot] = id;
+    self.entities(index.chunk(self.data.slots))[index.slot(self.data.slots)] = id;
 
     return index;
 }
@@ -272,20 +292,20 @@ pub fn append(self: *Bucket, id: Data.Entity) error{OutOfMemory}!Index {
 /// <----------------tail------
 /// ```
 pub fn remove(self: *Bucket, index: Index) void {
-    assert(@bitCast(u16, index) < self.data.len); // out of bounds
-    const item = self.nodes(index.chunk);
+    assert(@enumToInt(index) < self.data.len); // out of bounds
+    const item = self.nodes(index.chunk(self.data.slots));
 
     if (!self.free.isEmpty()) {
-        assert(@bitCast(u16, self.free.tail) < @bitCast(u16, index));
-        const tail = self.nodes(self.free.tail.chunk);
-        tail[self.free.tail.slot].next = index;
-        item[index.slot] = .{
+        assert(@enumToInt(self.free.tail) < @enumToInt(index));
+        const tail = self.nodes(self.free.tail.chunk(self.data.slots));
+        tail[self.free.tail.slot(self.data.slots)].next = index;
+        item[index.slot(self.data.slots)] = .{
             .next = index,
             .prev = self.free.tail,
         };
         self.free.tail = index;
     } else {
-        item[index.slot] = .{
+        item[index.slot(self.data.slots)] = .{
             .next = index,
             .prev = index,
         };
@@ -349,12 +369,12 @@ pub fn commit(self: *Bucket, closure: anytype) !void {
     self.free = .{};
 
     loop: while (true) {
-        while (@bitCast(u16, list.tail) == len - 1) {
+        while (@enumToInt(list.tail) == len - 1) {
             len -= 1;
             if (len == 0) break :loop;
 
-            const slot = list.tail.slot;
-            const chunk = list.tail.chunk;
+            const slot = list.tail.slot(self.data.slots);
+            const chunk = list.tail.chunk(self.data.slots);
             const prev = self.nodes(chunk)[slot].prev;
 
             if (list.tail.eql(prev)) break :loop;
@@ -362,13 +382,18 @@ pub fn commit(self: *Bucket, closure: anytype) !void {
             list.tail = prev;
         }
 
-        while (@bitCast(u16, list.tail) != len - 1 and @bitCast(u16, list.head) < len) {
+        while (@enumToInt(list.tail) != len - 1 and @enumToInt(list.head) < len) {
             len -= 1;
 
-            const old = @bitCast(Index, @intCast(u16, len));
+            const old = @intToEnum(Index, @intCast(u16, len));
 
-            const next = self.nodes(list.head.chunk)[list.head.slot].next;
-            const entity = self.entities(old.chunk)[old.slot];
+            const next_chunk = list.head.chunk(self.data.slots);
+            const next_slot = list.head.slot(self.data.slots);
+            const old_chunk = old.chunk(self.data.slots);
+            const old_slot = old.slot(self.data.slots);
+
+            const next = self.nodes(next_chunk)[next_slot].next;
+            const entity = self.entities(old_chunk)[old_slot];
 
             self.relocate(list.head, old);
 
@@ -378,7 +403,7 @@ pub fn commit(self: *Bucket, closure: anytype) !void {
             list.head = next;
         }
 
-        if (@bitCast(u16, list.head) >= len) break;
+        if (@enumToInt(list.head) >= len) break;
     }
 }
 
@@ -395,19 +420,19 @@ pub fn move(
     assert(dst.type.contains(spec)); // invalid move target
     assert(src.type.contains(spec)); // invalid move source
     assert( // invalid entity id
-        dst.entities(dst_index.chunk)[dst_index.slot].eql(
-        src.entities(src_index.chunk)[src_index.slot],
+        dst.entities(dst_index.chunk(dst.data.slots))[dst_index.slot(dst.data.slots)].eql(
+        src.entities(src_index.chunk(src.data.slots))[src_index.slot(src.data.slots)],
     ));
 
-    var dst_it = dst.iterate(dst_index.chunk);
-    var src_it = src.iterate(src_index.chunk);
+    var dst_it = dst.iterate(dst_index.chunk(dst.data.slots));
+    var src_it = src.iterate(src_index.chunk(src.data.slots));
     var spec_it = spec.iterator();
 
     while (spec_it.next()) |tag| {
         const size = Archetype.size[@enumToInt(tag)];
 
-        const dst_offset = size * @as(usize, dst_index.slot);
-        const src_offset = size * @as(usize, src_index.slot);
+        const dst_offset = size * @as(usize, dst_index.slot(dst.data.slots));
+        const src_offset = size * @as(usize, src_index.slot(src.data.slots));
 
         const dst_ptr = dst_it.find(tag).?.ptr + dst_offset;
         const src_ptr = src_it.find(tag).?.ptr + src_offset;
@@ -423,8 +448,14 @@ pub fn move(
 /// safety: this method is not safe as it doesn't update any external references
 ///         to the entity nor does it care if another entity is overwritten.
 pub fn relocate(self: *Bucket, dst: Index, src: Index) void {
-    const dst_base = self.block(dst.chunk).ptr;
-    const src_base = self.block(src.chunk).ptr;
+    const dst_chunk = dst.chunk(self.data.slots);
+    const src_chunk = src.chunk(self.data.slots);
+    const dst_slot = dst.slot(self.data.slots);
+    const src_slot = src.slot(self.data.slots);
+
+    const dst_base = self.block(dst_chunk).ptr;
+    const src_base = self.block(src_chunk).ptr;
+    const slots = @as(u16, 1) << self.data.slots;
 
     var offset: usize = 0;
     var it = self.type.iterator();
@@ -432,18 +463,18 @@ pub fn relocate(self: *Bucket, dst: Index, src: Index) void {
     while (it.next()) |tag| {
         const size = Archetype.size[@enumToInt(tag)];
 
-        const dst_slot = size * @as(usize, dst.slot);
-        const src_slot = size * @as(usize, src.slot);
+        const dst_slot_off = size * @as(usize, dst_slot);
+        const src_slot_off = size * @as(usize, src_slot);
 
-        const dst_ptr = dst_base + offset + dst_slot;
-        const src_ptr = src_base + offset + src_slot;
+        const dst_ptr = dst_base + offset + dst_slot_off;
+        const src_ptr = src_base + offset + src_slot_off;
 
-        offset += @as(usize, size) * 64;
+        offset += @as(usize, size) * slots;
 
         @memcpy(dst_ptr, src_ptr, size);
     }
 
-    self.entities(dst.chunk)[dst.slot] = self.entities(src.chunk)[src.slot];
+    self.entities(dst_chunk)[dst_slot] = self.entities(src_chunk)[src_slot];
 }
 
 /// `collect` tells the kernel that any of the pages above the current index
@@ -453,7 +484,8 @@ pub fn relocate(self: *Bucket, dst: Index, src: Index) void {
 pub fn collect(self: *Bucket) !void {
     const offset = (self.data.len >> slot_bits) * @as(usize, self.data.size);
     const aligned = offset + ((offset + mem.page_size) & mem.page_size);
-    const memory = @as(usize, self.size) * 1024;
+    const chunks = @as(u32, 1) << (16 - @as(u5, self.data.slots));
+    const memory = @as(usize, self.size) * chunks;
     try os.madvise(self.bytes + aligned, memory - aligned, os.MADV.DONTNEED);
 }
 
@@ -471,15 +503,8 @@ const TestMove = struct {
     }
 };
 
-fn idx(slot: u6, chunk: u10) Index {
-    return .{
-        .slot = slot,
-        .chunk = @intToEnum(Index.Chunk, chunk),
-    };
-}
-
-fn testBucket(entries: u16, comptime list: anytype) !Bucket {
-    var bucket = try Bucket.init(Archetype.fromList(list));
+fn testBucket(entries: u16, slots: u4, comptime list: anytype) !Bucket {
+    var bucket = try Bucket.init(Archetype.fromList(list), slots);
     errdefer bucket.deinit();
 
     var count: u16 = 0;
@@ -491,108 +516,136 @@ fn testBucket(entries: u16, comptime list: anytype) !Bucket {
 }
 
 test "removing entries from the start" {
-    var bucket = try testBucket(3, .{ .position_even, .velocity });
-    defer bucket.deinit();
+    var slots: u4 = 2;
+    while (true) {
+        var bucket = try testBucket(3, slots, .{ .position_even, .velocity });
+        defer bucket.deinit();
 
-    var context: TestMove = .{ .id = undefined };
-    for ([_]u6{ 2, 1, 0 }) |entry| {
-        context.set(&.{0xffff - @as(u32, entry)});
-        bucket.remove(idx(0, 0));
-        try bucket.commit(&context);
-        try testing.expectEqual(@as(u17, entry), bucket.data.len);
+        var context: TestMove = .{ .id = undefined };
+        for ([_]u6{ 2, 1, 0 }) |entry| {
+            context.set(&.{0xffff - @as(u32, entry)});
+            bucket.remove(@intToEnum(Index, 0));
+            try bucket.commit(&context);
+            try testing.expectEqual(@as(u17, entry), bucket.data.len);
+        }
+
+        slots +%= 1;
+        if (slots == 0) break;
     }
 }
 
 test "removing entries from the end" {
-    var bucket = try testBucket(3, .{ .position_even, .velocity });
-    defer bucket.deinit();
+    var slots: u4 = 2;
+    while (true) {
+        var bucket = try testBucket(3, slots, .{ .position_even, .velocity });
+        defer bucket.deinit();
 
-    var context: TestMove = .{ .id = undefined };
-    for ([_]u6{ 2, 1, 0 }) |index| {
-        bucket.remove(idx(index, 0));
-        try bucket.commit(&context);
-        try testing.expectEqual(@as(u17, index), bucket.data.len);
+        var context: TestMove = .{ .id = undefined };
+        for ([_]u6{ 2, 1, 0 }) |index| {
+            bucket.remove(@intToEnum(Index, index));
+            try bucket.commit(&context);
+            try testing.expectEqual(@as(u17, index), bucket.data.len);
+        }
+
+        slots +%= 1;
+        if (slots == 0) break;
     }
 }
 
 test "removing entries from the middle" {
-    var bucket = try testBucket(5, .{ .position_even, .velocity });
-    defer bucket.deinit();
+    var slots: u4 = 2;
+    while (true) {
+        var bucket = try testBucket(5, slots, .{ .position_even, .velocity });
+        defer bucket.deinit();
 
-    var context: TestMove = .{ .id = undefined };
-    context.set(&.{});
-    const expected = [_]u6{ 4, 3, 3, 4, 0 };
-    for ([_]u6{ 1, 2, 0, 0, 0 }) |entry, index| {
-        context.set(&.{0xffff - @as(u32, expected[index])}); // nothing moves
-        bucket.remove(idx(entry, 0));
-        try bucket.commit(&context);
-        try testing.expectEqual(4 - index, bucket.data.len);
+        var context: TestMove = .{ .id = undefined };
+        context.set(&.{});
+        const expected = [_]u6{ 4, 3, 3, 4, 0 };
+        for ([_]u6{ 1, 2, 0, 0, 0 }) |entry, index| {
+            context.set(&.{0xffff - @as(u32, expected[index])}); // nothing moves
+            bucket.remove(@intToEnum(Index, entry));
+            try bucket.commit(&context);
+            try testing.expectEqual(4 - index, bucket.data.len);
+        }
+
+        slots +%= 1;
+        if (slots == 0) break;
     }
 }
 
 test "removing entries from the ends" {
-    var bucket = try testBucket(5, .{ .position_even, .velocity });
-    defer bucket.deinit();
+    var slots: u4 = 2;
+    while (true) {
+        var bucket = try testBucket(5, slots, .{ .position_even, .velocity });
+        defer bucket.deinit();
 
-    var context: TestMove = .{ .id = undefined };
-    context.set(&.{ 0xffff - 3, 0xffff - 2 });
-    bucket.remove(idx(0, 0));
-    bucket.remove(idx(4, 0));
-    try bucket.commit(&context);
-    try testing.expectEqual(@as(u17, 3), bucket.data.len);
+        var context: TestMove = .{ .id = undefined };
+        context.set(&.{ 0xffff - 3, 0xffff - 2 });
+        bucket.remove(@intToEnum(Index, 0));
+        bucket.remove(@intToEnum(Index, 4));
+        try bucket.commit(&context);
+        try testing.expectEqual(@as(u17, 3), bucket.data.len);
 
-    context.set(&.{ 0xffff - 1, 0xffff - 2 });
-    bucket.remove(idx(0, 0));
-    bucket.remove(idx(2, 0));
-    try bucket.commit(&context);
-    try testing.expectEqual(@as(u17, 1), bucket.data.len);
+        context.set(&.{ 0xffff - 1, 0xffff - 2 });
+        bucket.remove(@intToEnum(Index, 0));
+        bucket.remove(@intToEnum(Index, 2));
+        try bucket.commit(&context);
+        try testing.expectEqual(@as(u17, 1), bucket.data.len);
 
-    context.set(&.{});
-    bucket.remove(idx(0, 0));
-    try bucket.commit(&context);
-    try testing.expectEqual(@as(u17, 0), bucket.data.len);
+        context.set(&.{});
+        bucket.remove(@intToEnum(Index, 0));
+        try bucket.commit(&context);
+        try testing.expectEqual(@as(u17, 0), bucket.data.len);
+
+        slots +%= 1;
+        if (slots == 0) break;
+    }
 }
 
 /// Calculate the size of a chunk for a given archetype
-pub fn chunkSize(archetype: *const Archetype) usize {
+pub fn chunkSize(archetype: *const Archetype, chunk_slots: u4) usize {
+    const slots = @as(u16, 1) << chunk_slots;
     var it = archetype.iterator();
 
     var bytes: usize = 0;
 
     while (it.next()) |tag| {
         const index = @enumToInt(tag);
-        bytes += @as(usize, Archetype.size[index]) * 64;
+        bytes += @as(usize, Archetype.size[index]) * slots;
+        assert(Archetype.alignment[index] <= slots); // padding required
     }
 
-    return bytes + entity_column;
+    return bytes + @sizeOf(Data.Entity) * @as(usize, slots);
 }
 
 /// Returns a slice of component memory within a chunk used to
 /// compute the direct pointer to a component array.
-pub fn block(self: *const Bucket, chunk: Index.Chunk) []u8 {
-    const start = self.data.size * @as(usize, @enumToInt(chunk));
-    const end = start + self.data.size - entity_column;
+pub fn block(self: *const Bucket, chunk: u16) []u8 {
+    const slots = @as(u16, 1) << self.data.slots;
+    const start = self.data.size * @as(usize, chunk);
+    const end = start + self.data.size - @sizeOf(Data.Entity) * @as(usize, slots);
     return self.bytes[start..end];
 }
 
 /// `nodes` return a slice of the entity ID array with each element
 /// interpreted as a node in the free list.
-fn nodes(self: *const Bucket, chunk: Index.Chunk) []Free.Node {
-    const es = self.entities(chunk);
+fn nodes(self: *const Bucket, index: u16) []Free.Node {
+    const es = self.entities(index);
     return @ptrCast([*]Free.Node, es.ptr)[0..es.len];
 }
 
 /// `entities` returns a slice of the entity ID array for the given
 /// chunk index.
-pub fn entities(self: *const Bucket, chunk: Index.Chunk) []Data.Entity {
+pub fn entities(self: *const Bucket, chunk: u16) []Data.Entity {
+    const slots = @as(u16, 1) << self.data.slots;
     const offset = //
-        self.data.size * @enumToInt(chunk) +
-        (self.data.size - entity_column);
+        self.data.size * chunk +
+        (self.data.size - @sizeOf(Data.Entity) * @as(usize, self.data.slots));
 
     const len = blk: {
-        const len = self.data.len - (@as(usize, @enumToInt(chunk)) << 6);
-        break :blk if (len >= 64) 64 else len;
+        const len = self.data.len - (@as(usize, chunk) << self.data.slots);
+        break :blk if (len >= slots) slots else len;
     };
 
-    return @ptrCast(*[64]Data.Entity, self.bytes + offset)[0..len];
+    return @ptrCast([*]Data.Entity, self.bytes + offset)[0..len];
 }

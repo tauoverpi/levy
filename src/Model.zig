@@ -100,12 +100,12 @@ pub fn new(
     pointer.bucket = target_index;
     pointer.index = index;
 
-    var it = target.iterate(index.chunk);
+    var it = target.iterate(index.chunk(target.data.slots));
     inline for (Archetype.fields) |field| {
         if (@hasField(Spec, field.name)) {
             const tag = @field(Archetype.Tag, field.name);
             const component = it.find(tag).?.array(tag);
-            component[index.slot] = @field(value, field.name);
+            component[index.slot(target.data.slots)] = @field(value, field.name);
         }
     }
 
@@ -126,7 +126,7 @@ pub fn register(self: *Model, gpa: Allocator, archetype: Archetype) !*Bucket {
     const bucket = try self.buckets.addOne(gpa);
     errdefer _ = self.buckets.pop();
 
-    bucket.* = try Bucket.init(archetype);
+    bucket.* = try Bucket.init(archetype, 6);
     entry.value_ptr.* = index;
 
     return bucket;
@@ -167,7 +167,7 @@ test "create a new entity then destroy it" {
 
     const entity = try model.new(testing.allocator, .insert, Spec, &.{});
 
-    var it = bucket.iterate(entity.index.chunk);
+    var it = bucket.iterate(entity.index.chunk(bucket.data.slots));
     while (it.next()) |component| {
         switch (component.tag) {
             .position_even => try testing.expectEqual(
@@ -228,13 +228,13 @@ pub fn update(
 
     pointer.bucket = target_index;
 
-    var it = bucket.iterate(index.chunk);
+    var it = bucket.iterate(index.chunk(bucket.data.slots));
 
     inline for (Archetype.fields) |field| {
         if (@hasField(Spec, field.name) and @sizeOf(field.field_type) != 0) {
             const tag = @field(Archetype.Tag, field.name);
             const component = it.find(tag).?.array(tag);
-            component[index.slot] = @field(value, field.name);
+            component[index.slot(bucket.data.slots)] = @field(value, field.name);
         }
     }
 }
@@ -258,7 +258,7 @@ test "create a new entity, update it, and then destroy it" {
         .velocity = .{ .x = 44, .y = 55, .z = 66 },
     });
 
-    var it = bucket.iterate(entity.index.chunk);
+    var it = bucket.iterate(entity.index.chunk(bucket.data.slots));
     while (it.next()) |component| {
         switch (component.tag) {
             .position_even => try testing.expectEqual(
@@ -302,7 +302,7 @@ test "create a new entity, move it, then destroy it" {
         .unallocated_affinity = 42,
     });
 
-    var it = new_bucket.iterate(entity.index.chunk);
+    var it = new_bucket.iterate(entity.index.chunk(new_bucket.data.slots));
     while (it.next()) |component| {
         switch (component.tag) {
             .position_even => try testing.expectEqual(
@@ -383,7 +383,7 @@ test "create a new entity, remove a component, then destroy it" {
     const entity = try model.new(testing.allocator, .insert, Spec, &.{});
     try model.remove(.insert, entity.id, .{.velocity});
 
-    var it = bucket.iterate(entity.index.chunk);
+    var it = bucket.iterate(entity.index.chunk(bucket.data.slots));
     while (it.next()) |component| {
         switch (component.tag) {
             .position_even => try testing.expectEqual(
@@ -496,7 +496,7 @@ pub fn Query(comptime archetype: Archetype, comptime mutable: Archetype) type {
             } {
                 const T = Archetype.TypeOf(tag);
 
-                const bytes = self.bucket.block(@intToEnum(Bucket.Index.Chunk, chunk));
+                const bytes = self.bucket.block(chunk);
                 const base = bytes.ptr + self.offset(tag);
 
                 return if (comptime mutable.have(tag))
