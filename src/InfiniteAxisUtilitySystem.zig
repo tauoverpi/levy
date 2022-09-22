@@ -5,11 +5,97 @@ const math = std.math;
 const meta = std.meta;
 
 pub const Response = struct {
+    //! A `Response` curve maps a measurement of the environment
+    //! to an estimated utility score used in deciding upon which
+    //! action to take.
+    //!
+    //! Consider the decision of picking between aggressive actions
+    //! and self preservation. For a simple character it may be
+    //! enough to declare that as health declines the desire for
+    //! aggressive actions follows:
+    //!
+    //! ```
+    //! health / 100
+    //! ```
+    //!
+    //! the opposite could also be defined where a character
+    //! becomes increasingly aggressive as they take more damage:
+    //!
+    //! ```
+    //! 1 - health / 100
+    //! ```
+    //!
+    //! and that would be fine should your characters only have
+    //! linear responses to stimulus. But what if you wanted to
+    //! define a character which would become less aggessive as
+    //! their health declines up to a limit where after they
+    //! suddenly jump to full aggression as if they're making
+    //! a final stand? enraged? berserk? You'll need something
+    //! better:
+    //!
+    //! ```
+    //! x = health / 100
+    //! eu = 2.5(x-0.45)^2 + -2.3(x-0.45)^3 + 7.7(x-0.45)^4 + 0.3
+    //! ```
+    //!
+    //! we gain the ability to modify how strong the response
+    //! by fitting it to a curve which invokes a strong response
+    //! at both extremes with a gradual decline from high health
+    //! to medium while only a sharp rise near critical health.
+    //! The curve is interpreted as follows:
+    //!
+    //! ```
+    //!                         health is critical causing the
+    //!                         character to lose hope in
+    //!                         recovering and picking a more
+    //!                         aggressive approach "if I'm
+    //!                         going down then I'm taking you
+    //!     ,------------------ with me"
+    //!     |
+    //!     v                   health is near full thus the
+    //!   y                     desire to perform aggressive
+    //! 1 | ;          ,'  <--- actions is higher due to lower
+    //!   | ;         ,         risk in getting hurt while a
+    //!   | ;        ,          higher reward for inflicting
+    //!   |  ,      ,           damage
+    //!   |    , , '
+    //!  0|          <--------- health is low so the desire to
+    //!   |________________ x   attack is low as the risk from
+    //!    0              1     taking more damage is higher
+    //!                         than the utility gained from
+    //!                         attacking.
+    //! ```
+    //!
+    //! Here we've mapped health to match the desired behaviour
+    //! by applying our very own response curve which maps an
+    //! otherwise linear value to that we wish for it to be.
+    //! Health isn't the only consideration that can be mapped
+    //! like this and usually the choice of performing an
+    //! aggressive action involves multiple considerations in
+    //! addition to health declared above such as:
+    //!
+    //! - distance to the target
+    //! - current weapon if any
+    //! - their weapon if any
+    //! - perceived level of threat
+    //! - perceived level of allied support
+    //! - status (stamina, mana, broken/fractured bones)
+    //! - purpose (self defence, enemy, bounty)
+    //!
+    //! and likely many more that need to be considered before
+    //! deciding which behaviour is the most suitable for the
+    //! current situation.
+
+    /// Function
     type: Type,
-    m: f32, // slope
-    c: f32, // x-shift
-    b: f32, // y-shift
-    k: f32, // exponent
+    /// Slope
+    m: f32,
+    /// X-shift
+    c: f32,
+    /// Y-shift
+    b: f32,
+    /// Exponent
+    k: f32,
 
     pub const Type = enum {
         linear,
@@ -20,6 +106,7 @@ pub const Response = struct {
         sine,
     };
 
+    /// Compute the response given a stimulus.
     pub fn y(self: Response, x: f32) f32 {
         return switch (self.type) {
             .linear => self.linear(x),
